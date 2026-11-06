@@ -1,0 +1,20 @@
+{
+  "name": "finpulse-railway-worker",
+  "version": "3.0.0",
+  "description": "FinPulse Railway worker: per-user WhatsApp sessions (UNOFFICIAL Baileys client), SBI mini-statement automation, DB-backed scheduler.",
+  "type": "module",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@whiskeysockets/baileys": "6.7.24",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "pino": "^9.3.2",
+    "qrcode": "^1.5.4"
+  }
+}
