@@ -21,7 +21,7 @@ const CODE = { loggedOut: 401, forbidden: 403, connectionReplaced: 440, restartR
  *   DISCONNECTED | CONNECTING | QR_READY | PAIRING_CODE_READY | CONNECTED | RECONNECTING
  */
 export class WhatsAppSession extends EventEmitter {
-  constructor({ userId, dir, socketFactory, log, linkWindowMs = 180000, menuTimeoutMs = 45000, clickFallbackMs = 25000 }) {
+  constructor({ userId, dir, socketFactory, log, defaultTarget = '', linkWindowMs = 180000, menuTimeoutMs = 45000, clickFallbackMs = 25000 }) {
     super();
     Object.assign(this, { userId, dir, socketFactory, log, linkWindowMs, menuTimeoutMs, clickFallbackMs });
     this.state = 'DISCONNECTED';
@@ -29,7 +29,32 @@ export class WhatsAppSession extends EventEmitter {
     this.qrDataUrl = null; this.pairingCode = null; this.phoneMasked = null; this.lastError = null;
     this.backoff = 0; this.reconnectTimer = null; this.stopping = false; this.linkDeadline = 0;
     this.job = null; this.seen = new Set(); this.lidMap = this.loadLidMap();
+    this.starting = null;            // single-flight guard: never two sockets for one user
+    this.generation = 0;             // identifies the live socket; events of older sockets are ignored
+    this.badSessionCount = 0;
+    this.saveChain = Promise.resolve();
+    this.targets = new Set(defaultTarget ? [String(defaultTarget).replace(/\D/g, '')] : []);
   }
+
+  /** Numbers (SBI) this session is allowed to read. Everything else is dropped BEFORE decryption. */
+  setTarget(number) { const n = String(number || '').replace(/\D/g, ''); if (n) this.targets.add(n); }
+
+  /**
+   * Passed to Baileys as shouldIgnoreJid. Group chats, status, newsletters and every private chat except the
+   * SBI number are acknowledged but never decrypted. This (a) stops the "Bad MAC" flood caused by unrelated chats,
+   * (b) means the app never reads your other private messages.
+   */
+  shouldIgnoreJid = (jid) => {
+    if (!jid) return false;
+    if (jid === '@s.whatsapp.net') return false;                       // server notifications
+    if (jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) return true;
+    if (jid.endsWith('@s.whatsapp.net')) return !this.targets.has(numberOf(jid));
+    if (jid.endsWith('@lid')) {                                         // hidden-number id: allow only SBI's once known
+      const learned = Object.values(this.lidMap);
+      return learned.length > 0 && !learned.includes(jid);
+    }
+    return false;
+  };
 
   // ---------- persistence ----------
   hasCredentials() { return fs.existsSync(path.join(this.dir, 'creds.json')); }
@@ -58,16 +83,26 @@ export class WhatsAppSession extends EventEmitter {
   /** Start (or resume) the socket. With stored credentials this reconnects silently. */
   async start() {
     if (this.sock) return;
+    if (this.starting) return this.starting;                            // a start is already in progress
+    this.starting = this.doStart().finally(() => { this.starting = null; });
+    return this.starting;
+  }
+
+  async doStart() {
     this.stopping = false;
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     this.setState(this.hasCredentials() ? 'RECONNECTING' : 'CONNECTING');
-    const { sock, saveCreds, registered, sendOptionReply } = await this.socketFactory({ dir: this.dir });
+    const gen = ++this.generation;
+    const { sock, saveCreds, registered, sendOptionReply } = await this.socketFactory({ dir: this.dir, shouldIgnoreJid: this.shouldIgnoreJid });
+    if (gen !== this.generation) { try { sock.end?.(undefined); } catch { /* superseded */ } return; }
     this.sock = sock; this.sendOptionReply = sendOptionReply; this.registered = !!registered;
 
-    sock.ev.on('creds.update', async () => { try { await saveCreds(); } catch (e) { this.log.error(`saveCreds failed: ${e.message}`); } });
+    sock.ev.on('creds.update', () => {
+      this.saveChain = this.saveChain.then(() => saveCreds()).catch(e => this.log.error(`saveCreds failed: ${e.message}`));
+    });
     sock.ev.on('connection.update', (u) => this.onConnection(u, sock));
     sock.ev.on('messages.upsert', ({ messages, type }) => {
-      if (type && type !== 'notify') return;                       // ignore history sync / appended messages
+      if (type && type !== 'notify') return;                            // ignore history sync / appended messages
       for (const m of messages || []) this.onMessage(m).catch(e => this.log.error(`message handler: ${e.message}`));
     });
   }
@@ -79,7 +114,7 @@ export class WhatsAppSession extends EventEmitter {
       catch (e) { this.log.error(`QR render failed: ${e.message}`); }
     }
     if (connection === 'open') {
-      this.backoff = 0; this.qrDataUrl = null; this.pairingCode = null; this.registered = true; this.lastError = null;
+      this.backoff = 0; this.badSessionCount = 0; this.qrDataUrl = null; this.pairingCode = null; this.registered = true; this.lastError = null;
       const num = numberOf(sock.user?.id);
       this.phoneMasked = num ? '•'.repeat(Math.max(0, num.length - 4)) + num.slice(-4) : null;
       this.setState('CONNECTED');
@@ -95,23 +130,48 @@ export class WhatsAppSession extends EventEmitter {
     this.sock = null; this.sendOptionReply = null;
     if (this.job) this.failJob(new WaError('DISCONNECTED', 'WhatsApp connection dropped during the fetch'));
     if (this.stopping) return;
+    this.log.warn(`socket closed: code=${code} ${msg || ''}`);
+    this.emit('closed', { code, message: msg || '' });
 
-    if (code === CODE.loggedOut || code === CODE.forbidden || code === CODE.badSession) {
-      this.log.warn(`session ended by WhatsApp (code ${code}); credentials removed, re-link required`);
+    if (code === CODE.loggedOut || code === CODE.forbidden) {
+      this.log.warn(`WhatsApp logged this device out (code ${code}); credentials removed, re-link required`);
       this.wipe(); this.phoneMasked = null; this.qrDataUrl = null; this.pairingCode = null; this.registered = false;
-      this.setState('DISCONNECTED', 'WhatsApp logged this device out. Please link again.');
+      this.setState('DISCONNECTED', code === CODE.loggedOut
+        ? 'WhatsApp logged this device out (401). This happens when the linked device is removed on the phone, or the stored session was lost. Please link again.'
+        : 'WhatsApp refused this device (403). Please link again.');
       this.emit('loggedOut');
       return;
     }
+    if (code === CODE.badSession) {
+      // Corrupt local session keys. Retry a couple of times before throwing the session away.
+      this.badSessionCount++;
+      if (this.badSessionCount > 2) {
+        this.log.warn('session keys are corrupt (500 x3); credentials removed, re-link required');
+        this.wipe(); this.phoneMasked = null; this.registered = false;
+        this.setState('DISCONNECTED', 'The saved WhatsApp session was corrupt (500). Please link again.');
+        this.emit('loggedOut');
+        return;
+      }
+      return this.scheduleReconnect('bad session (500), retrying');
+    }
     if (code === CODE.connectionReplaced) {
-      this.setState('DISCONNECTED', 'This session was replaced by another login.');
+      this.setState('DISCONNECTED', 'This WhatsApp session was replaced: it is open somewhere else too (another server/deployment using the same link). Link again after stopping the other one.');
       this.emit('disconnected');
       return;
     }
-    if (code === CODE.restartRequired) { this.setState('CONNECTING'); return this.start().catch(e => this.scheduleReconnect(e.message)); }
+    if (code === CODE.restartRequired) {                                 // normal right after QR / pairing
+      this.setState('CONNECTING');
+      await this.saveChain.catch(() => {});                              // make sure fresh credentials are on disk
+      await new Promise(r => setTimeout(r, 500));
+      return this.start().catch(e => this.scheduleReconnect(e.message));
+    }
 
-    if (!this.registered && !this.hasCredentials()) {               // still linking: QR/code expired -> refresh until window ends
-      if (Date.now() < this.linkDeadline) { this.reconnectTimer = setTimeout(() => this.start().catch(() => {}), 1000); return; }
+    if (!this.registered && !this.hasCredentials()) {                    // still linking: QR/code expired -> refresh until window ends
+      if (Date.now() < this.linkDeadline) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = setTimeout(() => this.start().catch(() => {}), 1000);
+        return;
+      }
       this.qrDataUrl = null; this.pairingCode = null;
       this.setState('DISCONNECTED', 'Linking timed out. Tap "Link WhatsApp" to try again.');
       return;
@@ -129,15 +189,23 @@ export class WhatsAppSession extends EventEmitter {
 
   async stopSocket() {
     this.stopping = true; clearTimeout(this.reconnectTimer);
+    this.generation++;                                                   // any socket still being created is discarded
     const s = this.sock; this.sock = null;
+    try { s?.ev?.removeAllListeners?.('connection.update'); s?.ev?.removeAllListeners?.('messages.upsert'); } catch { /* ignore */ }
     try { s?.end?.(undefined); } catch { /* ignore */ }
+    if (this.starting) await this.starting.catch(() => {});
+    await this.saveChain.catch(() => {});
   }
 
   /** Begin linking a NEW account (QR). Existing unfinished attempts are reset. */
   async startLinking() {
     if (this.state === 'CONNECTED') throw new WaError('ALREADY_LINKED', 'WhatsApp is already linked. Disconnect first.');
+    const inProgress = this.sock && !this.registered && ['CONNECTING', 'QR_READY', 'PAIRING_CODE_READY'].includes(this.state);
+    if (inProgress) { this.linkDeadline = Date.now() + this.linkWindowMs; return; }   // QR refreshes by itself; do not churn sockets
     await this.stopSocket();
-    if (!this.registered) this.wipe();
+    await new Promise(r => setTimeout(r, 1500));                         // let the old socket finish its file writes
+    this.wipe();                                                         // a NEW link always starts from an empty folder
+    this.registered = false; this.badSessionCount = 0;
     this.linkDeadline = Date.now() + this.linkWindowMs;
     this.qrDataUrl = null; this.pairingCode = null; this.lastError = null;
     await this.start();
@@ -148,8 +216,9 @@ export class WhatsAppSession extends EventEmitter {
     const digits = String(phone || '').replace(/\D/g, '');
     if (digits.length < 10 || digits.length > 15) throw new WaError('BAD_PHONE', 'Enter your WhatsApp number with country code, e.g. 919876543210');
     if (this.state === 'CONNECTED') throw new WaError('ALREADY_LINKED', 'WhatsApp is already linked.');
-    if (!this.sock) await this.startLinking();
+    await this.startLinking();
     for (let i = 0; i < 30 && !this.sock?.requestPairingCode; i++) await new Promise(r => setTimeout(r, 500));
+    if (!this.sock) throw new WaError('NOT_CONNECTED', 'WhatsApp socket is not ready. Try again.');
     // WhatsApp only accepts the request once the socket has started its handshake
     await new Promise(r => setTimeout(r, 1500));
     const code = await this.sock.requestPairingCode(digits);
@@ -160,9 +229,12 @@ export class WhatsAppSession extends EventEmitter {
   async logout() {
     this.stopping = true; clearTimeout(this.reconnectTimer);
     if (this.job) this.failJob(new WaError('DISCONNECTED', 'Session disconnected by user'));
+    this.generation++;
     const s = this.sock; this.sock = null;
     try { await s?.logout?.(); } catch { /* may already be closed */ }
     try { s?.end?.(undefined); } catch { /* ignore */ }
+    await this.saveChain.catch(() => {});
+    await new Promise(r => setTimeout(r, 800));
     this.wipe();
     this.qrDataUrl = null; this.pairingCode = null; this.phoneMasked = null; this.registered = false;
     this.setState('DISCONNECTED', null);

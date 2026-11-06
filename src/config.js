@@ -10,10 +10,17 @@ export function loadConfig(env = process.env) {
   const secret = need('SERVICE_SECRET');
   if (secret.length < 32) throw new Error('SERVICE_SECRET must be at least 32 characters');
 
-  const dataDir = env.DATA_DIR || (fs.existsSync('/data') ? '/data' : './data');
+  // Railway sets RAILWAY_VOLUME_MOUNT_PATH only when a Volume is attached. Prefer it, so data lands on the volume
+  // even if DATA_DIR was typed wrong.
+  const volumePath = (env.RAILWAY_VOLUME_MOUNT_PATH || '').trim();
+  const onRailway = !!(env.RAILWAY_ENVIRONMENT || env.RAILWAY_PROJECT_ID || env.RAILWAY_SERVICE_ID);
+  const dataDir = volumePath || env.DATA_DIR || (fs.existsSync('/data') ? '/data' : './data');
+  const persistentStorage = !onRailway || !!volumePath || env.ALLOW_EPHEMERAL_STORAGE === 'true';
   return {
     port: parseInt(env.PORT || '3000', 10),
     dataDir,
+    persistentStorage,
+    onRailway,
     cpanelApiUrl: need('CPANEL_API_URL').replace(/\/+$/, ''),
     serviceSecret: secret,
     // Initial default for NEW users is set on cPanel (SBI_DEFAULT_TARGET); this is only a fallback label.

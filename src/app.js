@@ -16,7 +16,7 @@ export function createApp({ cfg, cpanel, sessions, scheduler, outbox, log }) {
   app.use((req, res, next) => { res.set({ 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }); next(); });
 
   // Public, non-sensitive liveness probe (Railway health check).
-  app.get(['/', '/health'], (req, res) => res.json({ ok: true, service: 'finpulse-railway-worker', uptimeSeconds: Math.round(process.uptime()) }));
+  app.get(['/', '/health'], (req, res) => res.json({ ok: true, service: 'finpulse-railway-worker', persistentStorage: cfg.persistentStorage, uptimeSeconds: Math.round(process.uptime()) }));
 
   const auth = makeAuth({ cpanel });
   const general = rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false, message: { success: false, code: 'RATE_LIMITED', message: 'Too many requests' } });
@@ -37,16 +37,19 @@ export function createApp({ cfg, cpanel, sessions, scheduler, outbox, log }) {
   const waStatus = (userId) => sessions.get(userId)?.getPublicStatus() ?? { state: 'DISCONNECTED', connected: false, hasSession: false, qrDataUrl: null, pairingCode: null, phoneMasked: null, lastError: null };
 
   // ---------- WhatsApp linking ----------
+  const NO_VOLUME = { success: false, code: 'NO_PERSISTENT_VOLUME', message: 'The Railway server has no Volume attached, so the WhatsApp link would be lost on every restart/redeploy. Attach a Volume with mount path /data in Railway, then link again.' };
+  const needVolume = (req, res, next) => (cfg.persistentStorage ? next() : res.status(409).json(NO_VOLUME));
+
   api.get('/whatsapp/status', wrap(async (req, res) => {
-    res.json({ success: true, whatsapp: waStatus(req.userId), unofficialNotice: 'Unofficial WhatsApp client (Baileys). Not an official WhatsApp/SBI API; account restrictions are possible.' });
+    res.json({ success: true, storagePersistent: cfg.persistentStorage, whatsapp: waStatus(req.userId), unofficialNotice: 'Unofficial WhatsApp client (Baileys). Not an official WhatsApp/SBI API; account restrictions are possible.' });
   }));
 
-  api.post('/whatsapp/link/qr', linkLimiter, wrap(async (req, res) => {
+  api.post('/whatsapp/link/qr', needVolume, linkLimiter, wrap(async (req, res) => {
     await sessions.getOrCreate(req.userId).startLinking();
     res.json({ success: true, message: 'Linking started. Poll /api/whatsapp/status for the QR code.', whatsapp: waStatus(req.userId) });
   }));
 
-  api.post('/whatsapp/link/pair', linkLimiter, wrap(async (req, res) => {
+  api.post('/whatsapp/link/pair', needVolume, linkLimiter, wrap(async (req, res) => {
     const code = await sessions.getOrCreate(req.userId).requestPairingCode(req.body?.phone);
     res.json({ success: true, pairingCode: code, message: 'In WhatsApp: Linked devices > Link a device > Link with phone number instead, then enter this code.' });
   }));

@@ -23,6 +23,9 @@ const sessions = new SessionManager({
 });
 scheduler = new Scheduler({ cfg, cpanel, sessions, outbox, log: makeLog('scheduler') });
 
+if (!cfg.persistentStorage) {
+  log.error('NO PERSISTENT VOLUME: files in ' + cfg.dataDir + ' are deleted on every restart/redeploy, so WhatsApp links will keep disconnecting. Attach a Railway Volume (mount path /data). Linking is blocked until then.');
+}
 const app = createApp({ cfg, cpanel, sessions, scheduler, outbox, log });
 const server = app.listen(cfg.port, () => {
   log.info(`listening on :${cfg.port}  data=${cfg.dataDir}  cpanel=${cfg.cpanelApiUrl}`);

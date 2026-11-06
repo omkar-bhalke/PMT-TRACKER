@@ -6,10 +6,10 @@
  */
 import pino from 'pino';
 
-export async function baileysSocketFactory({ dir }) {
+export async function baileysSocketFactory({ dir, shouldIgnoreJid }) {
   const baileys = await import('@whiskeysockets/baileys');
   const makeWASocket = baileys.default?.default || baileys.default || baileys.makeWASocket;
-  const { useMultiFileAuthState, fetchLatestBaileysVersion, generateWAMessageFromContent, proto } = baileys;
+  const { useMultiFileAuthState, fetchLatestBaileysVersion, generateWAMessageFromContent, proto, Browsers } = baileys;
 
   const { state, saveCreds } = await useMultiFileAuthState(dir);
   const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
@@ -19,9 +19,17 @@ export async function baileysSocketFactory({ dir }) {
     auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
-    browser: ['FinPulse', 'Chrome', '124.0.0'],
+    // Standard browser identity: required for pairing-code login to work reliably.
+    browser: Browsers.ubuntu('Chrome'),
     markOnlineOnConnect: false,
     syncFullHistory: false,
+    shouldSyncHistoryMessage: () => false,        // never download the chat history
+    emitOwnEvents: false,
+    generateHighQualityLinkPreview: false,
+    // Only the SBI chat is read; all other chats are acknowledged without being decrypted.
+    shouldIgnoreJid: shouldIgnoreJid || (() => false),
+    getMessage: async () => undefined,
+    keepAliveIntervalMs: 25000,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
   });

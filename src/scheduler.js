@@ -81,6 +81,7 @@ export class Scheduler {
     }
 
     let result;
+    session.setTarget(claim.targetNumber);
     try {
       result = await session.runStatementCycle({ targetNumber: claim.targetNumber, timeoutMs: this.cfg.cycleTimeoutMs });
     } catch (e) {

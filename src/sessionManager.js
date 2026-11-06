@@ -25,11 +25,12 @@ export class SessionManager {
     let s = this.sessions.get(userId);
     if (s) return s;
     s = new WhatsAppSession({
-      userId, dir: this.dirFor(userId), socketFactory: this.socketFactory, log: this.makeLog(`wa:${userId.slice(-6)}`),
+      userId, dir: this.dirFor(userId), socketFactory: this.socketFactory, defaultTarget: this.cfg.defaultTarget, log: this.makeLog(`wa:${userId.slice(-6)}`),
       linkWindowMs: this.cfg.linkWindowMs, menuTimeoutMs: this.cfg.menuTimeoutMs,
     });
     s.on('state', (st) => this.report(userId, s, st));
-    s.on('connected', () => this.onConnected(userId));
+    s.on('connected', () => { this.cpanel.log(userId, 'WA_CONNECTED', 'WhatsApp connected').catch(() => {}); this.onConnected(userId); });
+    s.on('closed', ({ code, message }) => this.cpanel.log(userId, 'WA_CLOSED', `WhatsApp connection closed (code ${code ?? 'unknown'}) ${String(message).slice(0, 120)}`.trim()).catch(() => {}));
     s.on('loggedOut', () => this.cpanel.whatsappStatus(userId, 'LOGGED_OUT', { error: s.lastError }).catch(() => {}));
     this.sessions.set(userId, s);
     return s;
